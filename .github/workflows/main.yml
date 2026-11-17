@@ -1,0 +1,159 @@
+name: FTTH 24/7 Live Auto-Sync
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright & Requests
+        run: |
+          pip install playwright requests
+          playwright install chromium
+
+      - name: Run FTTH Auto-Sync
+        env:
+          FTTH_ALHIL_USER: ${{ secrets.FTTH_ALHIL_USER }}
+          FTTH_ALHIL_PASS: ${{ secrets.FTTH_ALHIL_PASS }}
+          FTTH_HLE_USER: ${{ secrets.FTTH_HLE_USER }}
+          FTTH_HLE_PASS: ${{ secrets.FTTH_HLE_PASS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - << 'EOF'
+          import json, os, requests
+          from datetime import datetime, timezone, timedelta
+          from playwright.sync_api import sync_playwright
+
+          IQ_TZ = timezone(timedelta(hours=3))
+          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "204598344").strip()
+
+          ACCOUNTS = []
+          if os.environ.get("FTTH_ALHIL_USER") and os.environ.get("FTTH_ALHIL_PASS"):
+              ACCOUNTS.append({"code": "alhil", "u": os.environ["FTTH_ALHIL_USER"], "p": os.environ["FTTH_ALHIL_PASS"]})
+          if os.environ.get("FTTH_HLE_USER") and os.environ.get("FTTH_HLE_PASS"):
+              ACCOUNTS.append({"code": "hle", "u": os.environ["FTTH_HLE_USER"], "p": os.environ["FTTH_HLE_PASS"]})
+
+          def fetch_acct(page, acct):
+              subs = {}
+              def on_res(res):
+                  try:
+                      if "subscriptions" in res.url and res.status == 200 and "json" in (res.headers.get("content-type") or ""):
+                          d = res.json()
+                          items = d.get("data") or d.get("items") or (d if isinstance(d, list) else [])
+                          for x in (items if isinstance(items, list) else []):
+                              if isinstance(x, dict) and "hasActiveSession" in x and "customer" in x:
+                                  cid = str((x.get("customer") or {}).get("id") or "")
+                                  un = str(x.get("username") or "").strip()
+                                  k = cid or un
+                                  if k:
+                                      svcs = x.get("services") or []
+                                      subs[k] = {
+                                          "account": acct["code"],
+                                          "subId": cid,
+                                          "name": (x.get("customer") or {}).get("displayValue", ""),
+                                          "username": un,
+                                          "status": x.get("status", "Inactive"),
+                                          "isActive": x.get("status") == "Active",
+                                          "hasActiveSession": bool(x.get("hasActiveSession")),
+                                          "expires": str(x.get("expires") or "")[:10],
+                                          "ipAddress": x.get("ipAddress") or ((x.get("activeSession") or {}).get("ipAddress") or ""),
+                                          "serviceType": svcs[0].get("displayValue", "Basic") if svcs else "Basic"
+                                      }
+                  except Exception:
+                      pass
+              page.on("response", on_res)
+              page.goto("https://admin.ftth.iq/login", wait_until="networkidle", timeout=60000)
+              page.locator('input[type="text"], input[formcontrolname="username"], input[name="username"]').first.fill(acct["u"])
+              page.locator('input[type="password"], input[formcontrolname="password"], input[name="password"]').first.fill(acct["p"])
+              page.locator('button[type="submit"]').first.click()
+              page.wait_for_timeout(4500)
+              page.goto("https://admin.ftth.iq/subscriptions", wait_until="networkidle", timeout=60000)
+              page.wait_for_timeout(3500)
+              for _ in range(40):
+                  nb = page.locator('button.mat-paginator-navigation-next, [aria-label*="Next"], [aria-label*="التالي"]').first
+                  if nb.count() == 0 or nb.is_disabled():
+                      break
+                  nb.click()
+                  page.wait_for_timeout(1600)
+              page.remove_listener("response", on_res)
+              return list(subs.values())
+
+          prev = {}
+          if os.path.exists("live_sync.json"):
+              try:
+                  with open("live_sync.json", "r", encoding="utf-8") as f:
+                      for s in json.load(f).get("subscribers", []):
+                          prev[f"{s.get('account')}:{s.get('username')}"] = s
+              except Exception:
+                  pass
+
+          all_subs = []
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=True)
+              for a in ACCOUNTS:
+                  ctx = b.new_context()
+                  pg = ctx.new_page()
+                  try:
+                      all_subs.extend(fetch_acct(pg, a))
+                  except Exception as e:
+                      print("Error:", a["code"], e)
+                  finally:
+                      ctx.close()
+              b.close()
+
+          if all_subs:
+              new_act, new_exp = [], []
+              for s in all_subs:
+                  old = prev.get(f"{s['account']}:{s['username']}")
+                  s["newlyActivated"] = bool(old and not old.get("isActive") and s["isActive"])
+                  s["newlyExpired"] = bool(old and old.get("isActive") and not s["isActive"])
+                  if s["newlyActivated"]: new_act.append(s)
+                  if s["newlyExpired"]: new_exp.append(s)
+
+              now_str = datetime.now(IQ_TZ).strftime("%Y-%m-%d %H:%M")
+              out = {
+                  "syncedAt": now_str,
+                  "totalCount": len(all_subs),
+                  "activeCount": sum(1 for x in all_subs if x["isActive"]),
+                  "expiredCount": sum(1 for x in all_subs if not x["isActive"]),
+                  "subscribers": all_subs
+              }
+              with open("live_sync.json", "w", encoding="utf-8") as f:
+                  json.dump(out, f, ensure_ascii=False, indent=2)
+
+              if (new_act or new_exp) and BOT_TOKEN and CHAT_ID:
+                  msg = [f"📡 <b>تحديث تلقائي FTTH IQ ({now_str})</b>"]
+                  if new_act:
+                      msg.append(f"\n🟢 <b>مفعل حديثاً ({len(new_act)}):</b>")
+                      msg.extend([f"• {x['name']} ({x['username']})" for x in new_act[:10]])
+                  if new_exp:
+                      msg.append(f"\n🔴 <b>انتهى الآن ({len(new_exp)}):</b>")
+                      msg.extend([f"• {x['name']} ({x['username']})" for x in new_exp[:10]])
+                  requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": "\n".join(msg), "parse_mode": "HTML"})
+          EOF
+
+      - name: Save live_sync.json to Repo
+        run: |
+          if [ -f live_sync.json ]; then
+            git config user.name "FTTH Radar Bot"
+            git config user.email "bot@ftth-radar.local"
+            git add live_sync.json
+            git diff --staged --quiet || (git commit -m "Live Sync Update" && git push)
+          fi
+          
