@@ -35,125 +35,274 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - << 'EOF'
-          import json, os, requests
+          import json, os, re, time, requests
           from datetime import datetime, timezone, timedelta
           from playwright.sync_api import sync_playwright
 
           IQ_TZ = timezone(timedelta(hours=3))
-          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "204598344").strip()
+          TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "204598344").strip()
 
           ACCOUNTS = []
           if os.environ.get("FTTH_ALHIL_USER") and os.environ.get("FTTH_ALHIL_PASS"):
-              ACCOUNTS.append({"code": "alhil", "u": os.environ["FTTH_ALHIL_USER"], "p": os.environ["FTTH_ALHIL_PASS"]})
+              ACCOUNTS.append({
+                  "code": "alhil",
+                  "username": os.environ["FTTH_ALHIL_USER"].strip(),
+                  "password": os.environ["FTTH_ALHIL_PASS"].strip(),
+              })
           if os.environ.get("FTTH_HLE_USER") and os.environ.get("FTTH_HLE_PASS"):
-              ACCOUNTS.append({"code": "hle", "u": os.environ["FTTH_HLE_USER"], "p": os.environ["FTTH_HLE_PASS"]})
+              ACCOUNTS.append({
+                  "code": "hle",
+                  "username": os.environ["FTTH_HLE_USER"].strip(),
+                  "password": os.environ["FTTH_HLE_PASS"].strip(),
+              })
 
-          def fetch_acct(page, acct):
-              subs = {}
-              def on_res(res):
+          def send_telegram_alert(message: str):
+              if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                  return
+              try:
+                  requests.post(
+                      f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                      json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+                      timeout=15,
+                  )
+              except Exception as e:
+                  print("Telegram error:", e)
+
+          def login_ftth(page, acct):
+              print(f"🔐 [{acct['code']}] فتح بوابة admin.ftth.iq ...")
+              page.goto("https://admin.ftth.iq/", wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_selector("input[type='password']", timeout=30000)
+
+              # Verified selector for admin.ftth.iq: username input has NO type='text' attribute
+              user_input = page.locator("input:not([type='password']):not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='submit'])").first
+              pass_input = page.locator("input[type='password']").first
+
+              user_input.fill(acct["username"])
+              pass_input.fill(acct["password"])
+
+              submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('تسجيل'), button:has-text('Login'), button:has-text('Sign in')").first
+              if submit_btn.count() > 0:
+                  submit_btn.click()
+              else:
+                  pass_input.press("Enter")
+
+              page.wait_for_timeout(5000)
+              print(f"✅ [{acct['code']}] تم تسجيل الدخول — الرابط الحالي: {page.url}")
+
+          def fetch_account_data_by_fat(page, acct):
+              captured_fats = {}
+              captured_subs = {}
+
+              def on_response(res):
                   try:
-                      if "subscriptions" in res.url and res.status == 200 and "json" in (res.headers.get("content-type") or ""):
-                          d = res.json()
-                          items = d.get("data") or d.get("items") or (d if isinstance(d, list) else [])
-                          for x in (items if isinstance(items, list) else []):
-                              if isinstance(x, dict) and "hasActiveSession" in x and "customer" in x:
-                                  cid = str((x.get("customer") or {}).get("id") or "")
-                                  un = str(x.get("username") or "").strip()
-                                  k = cid or un
-                                  if k:
-                                      svcs = x.get("services") or []
-                                      subs[k] = {
-                                          "account": acct["code"],
-                                          "subId": cid,
-                                          "name": (x.get("customer") or {}).get("displayValue", ""),
-                                          "username": un,
-                                          "status": x.get("status", "Inactive"),
-                                          "isActive": x.get("status") == "Active",
-                                          "hasActiveSession": bool(x.get("hasActiveSession")),
-                                          "expires": str(x.get("expires") or "")[:10],
-                                          "ipAddress": x.get("ipAddress") or ((x.get("activeSession") or {}).get("ipAddress") or ""),
-                                          "serviceType": svcs[0].get("displayValue", "Basic") if svcs else "Basic"
-                                      }
+                      ctype = res.headers.get("content-type") or ""
+                      if res.status != 200 or "application/json" not in ctype:
+                          return
+                      data = res.json()
+                      items = data.get("data") or data.get("items") or (data if isinstance(data, list) else [])
+                      if not isinstance(items, list):
+                          return
+                      for item in items:
+                          if not isinstance(item, dict):
+                              continue
+                          # 1) Official FAT & FDT from /customers (NEVER from username!)
+                          if "deviceDetails" in item and "customer" in item:
+                              cid = str((item.get("customer") or {}).get("id") or "").strip()
+                              dd = item.get("deviceDetails") or {}
+                              fat_raw = str((dd.get("fat") or {}).get("displayValue") or "").strip().upper()
+                              fdt_raw = str((dd.get("fdt") or {}).get("displayValue") or (item.get("zone") or {}).get("displayValue") or "").strip().upper()
+                              sn_raw = str(dd.get("serial") or "").strip().upper()
+                              uname_raw = str(dd.get("username") or "").strip()
+                              m = re.search(r"(\d{1,2})", fat_raw)
+                              if cid and fat_raw and m:
+                                  fat_num = int(m.group(1))
+                                  captured_fats[cid] = {
+                                      "subId": cid,
+                                      "name": str((item.get("customer") or {}).get("displayValue") or "").strip(),
+                                      "fat": f"FAT{fat_num}",
+                                      "fatNumber": fat_num,
+                                      "fdt": fdt_raw,
+                                      "sn": sn_raw,
+                                      "username": uname_raw,
+                                  }
+                          # 2) Live subscription status, session & expiry from /subscriptions
+                          elif "hasActiveSession" in item and "customer" in item:
+                              cid = str((item.get("customer") or {}).get("id") or "").strip()
+                              if cid:
+                                  svcs = item.get("services") or []
+                                  svc_name = svcs[0].get("displayValue", "Basic") if svcs else "Basic"
+                                  exp_iso = str(item.get("expires") or "")
+                                  captured_subs[cid] = {
+                                      "account": acct["code"],
+                                      "subId": cid,
+                                      "name": str((item.get("customer") or {}).get("displayValue") or "").strip(),
+                                      "username": str(item.get("username") or "").strip(),
+                                      "status": item.get("status", "Inactive"),
+                                      "isActive": item.get("status") == "Active",
+                                      "hasActiveSession": bool(item.get("hasActiveSession")),
+                                      "expires": exp_iso[:10],
+                                      "expiresIso": exp_iso,
+                                      "ipAddress": item.get("ipAddress") or ((item.get("activeSession") or {}).get("ipAddress") or ""),
+                                      "serviceType": svc_name,
+                                      "zone": str((item.get("zone") or {}).get("displayValue") or "").strip(),
+                                  }
                   except Exception:
                       pass
-              page.on("response", on_res)
-              page.goto("https://admin.ftth.iq/login", wait_until="networkidle", timeout=60000)
-              page.locator('input[type="text"], input[formcontrolname="username"], input[name="username"]').first.fill(acct["u"])
-              page.locator('input[type="password"], input[formcontrolname="password"], input[name="password"]').first.fill(acct["p"])
-              page.locator('button[type="submit"]').first.click()
-              page.wait_for_timeout(4500)
-              page.goto("https://admin.ftth.iq/subscriptions", wait_until="networkidle", timeout=60000)
-              page.wait_for_timeout(3500)
-              for _ in range(40):
-                  nb = page.locator('button.mat-paginator-navigation-next, [aria-label*="Next"], [aria-label*="التالي"]').first
-                  if nb.count() == 0 or nb.is_disabled():
+
+              page.on("response", on_response)
+              login_ftth(page, acct)
+
+              # PHASE 1: Pull official FAT numbers from /customers
+              print(f"📡 [{acct['code']}] سحب أرقام الفات (FAT) من صفحة المشتركين...")
+              page.goto("https://admin.ftth.iq/customers", wait_until="networkidle", timeout=60000)
+              page.wait_for_timeout(3000)
+              for _ in range(65):
+                  next_btn = page.locator("button.mat-paginator-navigation-next, [aria-label*='Next'], [aria-label*='التالي']").first
+                  if next_btn.count() == 0 or next_btn.is_disabled():
                       break
-                  nb.click()
+                  next_btn.click()
                   page.wait_for_timeout(1600)
-              page.remove_listener("response", on_res)
-              return list(subs.values())
+              print(f"✅ [{acct['code']}] تم سحب رقم الفات الرسمي لـ {len(captured_fats)} مشترك.")
 
-          prev = {}
-          if os.path.exists("live_sync.json"):
-              try:
-                  with open("live_sync.json", "r", encoding="utf-8") as f:
-                      for s in json.load(f).get("subscribers", []):
-                          prev[f"{s.get('account')}:{s.get('username')}"] = s
-              except Exception:
-                  pass
+              # PHASE 2: Pull live Active/Expired status & sessions from /subscriptions
+              print(f"📡 [{acct['code']}] سحب حالات الشغال والطافي من صفحة الاشتراكات...")
+              page.goto("https://admin.ftth.iq/subscriptions", wait_until="networkidle", timeout=60000)
+              page.wait_for_timeout(3000)
+              for _ in range(65):
+                  next_btn = page.locator("button.mat-paginator-navigation-next, [aria-label*='Next'], [aria-label*='التالي']").first
+                  if next_btn.count() == 0 or next_btn.is_disabled():
+                      break
+                  next_btn.click()
+                  page.wait_for_timeout(1500)
+              print(f"✅ [{acct['code']}] تم سحب حالة الاشتراك لـ {len(captured_subs)} مشترك.")
 
-          all_subs = []
-          with sync_playwright() as p:
-              b = p.chromium.launch(headless=True)
-              for a in ACCOUNTS:
-                  ctx = b.new_context()
-                  pg = ctx.new_page()
+              page.remove_listener("response", on_response)
+
+              now_utc_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+              all_cids = set(captured_fats.keys()) | set(captured_subs.keys())
+              merged = []
+              for cid in all_cids:
+                  f_info = captured_fats.get(cid, {})
+                  s_info = captured_subs.get(cid, {})
+                  exp_iso = s_info.get("expiresIso", "")
+                  is_expired_by_time = bool(exp_iso and exp_iso[:19] <= now_utc_iso)
+                  is_act = False if is_expired_by_time else bool(s_info.get("isActive", False))
+                  merged.append({
+                      "account": acct["code"],
+                      "subId": cid,
+                      "name": s_info.get("name") or f_info.get("name") or f"مشترك {cid}",
+                      "fat": f_info.get("fat", ""),
+                      "fatNumber": f_info.get("fatNumber"),
+                      "fdt": f_info.get("fdt") or s_info.get("zone") or "",
+                      "sn": f_info.get("sn", ""),
+                      "username": s_info.get("username") or f_info.get("username") or "",
+                      "status": "Active" if is_act else "Inactive",
+                      "isActive": is_act,
+                      "hasActiveSession": bool(s_info.get("hasActiveSession", False)) if is_act else False,
+                      "expires": s_info.get("expires", ""),
+                      "expiresIso": exp_iso,
+                      "ipAddress": s_info.get("ipAddress", "") if is_act else "",
+                      "serviceType": s_info.get("serviceType", "Basic"),
+                  })
+              return merged
+
+          def main():
+              if not ACCOUNTS:
+                  print("❌ لم يتم العثور على FTTH_ALHIL_USER أو FTTH_HLE_USER في GitHub Secrets!")
+                  return
+
+              prev_map = {}
+              if os.path.exists("live_sync.json"):
                   try:
-                      all_subs.extend(fetch_acct(pg, a))
-                  except Exception as e:
-                      print("Error:", a["code"], e)
-                  finally:
-                      ctx.close()
-              b.close()
+                      with open("live_sync.json", "r", encoding="utf-8") as f:
+                          prev_data = json.load(f)
+                          for s in prev_data.get("subscribers", []):
+                              sid = str(s.get("subId") or "").strip()
+                              if sid:
+                                  prev_map[sid] = s
+                  except Exception:
+                      pass
 
-          if all_subs:
-              new_act, new_exp = [], []
+              all_subs = []
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  for acct in ACCOUNTS:
+                      context = browser.new_context()
+                      page = context.new_page()
+                      try:
+                          subs = fetch_account_data_by_fat(page, acct)
+                          all_subs.extend(subs)
+                      except Exception as e:
+                          print(f"⚠️ خطأ في حساب {acct['code']}: {e}")
+                      finally:
+                          context.close()
+                  browser.close()
+
+              if not all_subs:
+                  print("⚠️ لم يتم سحب أي مشتركين في هذه الدورة.")
+                  return
+
+              newly_activated = []
+              newly_expired = []
               for s in all_subs:
-                  old = prev.get(f"{s['account']}:{s['username']}")
-                  s["newlyActivated"] = bool(old and not old.get("isActive") and s["isActive"])
-                  s["newlyExpired"] = bool(old and old.get("isActive") and not s["isActive"])
-                  if s["newlyActivated"]: new_act.append(s)
-                  if s["newlyExpired"]: new_exp.append(s)
+                  sid = str(s.get("subId") or "").strip()
+                  old = prev_map.get(sid)
+                  if not s.get("fat") and old and old.get("fat"):
+                      s["fat"] = old["fat"]
+                      s["fatNumber"] = old.get("fatNumber")
+                  if not s.get("fdt") and old and old.get("fdt"):
+                      s["fdt"] = old["fdt"]
+                  if not s.get("sn") and old and old.get("sn"):
+                      s["sn"] = old["sn"]
+                  s["newlyActivated"] = False
+                  s["newlyExpired"] = False
+                  if old:
+                      if not old.get("isActive") and s["isActive"]:
+                          s["newlyActivated"] = True
+                          newly_activated.append(s)
+                      elif old.get("isActive") and not s["isActive"]:
+                          s["newlyExpired"] = True
+                          newly_expired.append(s)
 
-              now_str = datetime.now(IQ_TZ).strftime("%Y-%m-%d %H:%M")
+              now_iq = datetime.now(IQ_TZ).strftime("%Y-%m-%d %H:%M")
               out = {
-                  "syncedAt": now_str,
+                  "syncedAt": now_iq,
+                  "syncMode": "FAT_NUMBER_STRICT",
                   "totalCount": len(all_subs),
                   "activeCount": sum(1 for x in all_subs if x["isActive"]),
                   "expiredCount": sum(1 for x in all_subs if not x["isActive"]),
-                  "subscribers": all_subs
+                  "newlyActivatedCount": len(newly_activated),
+                  "newlyExpiredCount": len(newly_expired),
+                  "subscribers": all_subs,
               }
               with open("live_sync.json", "w", encoding="utf-8") as f:
                   json.dump(out, f, ensure_ascii=False, indent=2)
 
-              if (new_act or new_exp) and BOT_TOKEN and CHAT_ID:
-                  msg = [f"📡 <b>تحديث تلقائي FTTH IQ ({now_str})</b>"]
-                  if new_act:
-                      msg.append(f"\n🟢 <b>مفعل حديثاً ({len(new_act)}):</b>")
-                      msg.extend([f"• {x['name']} ({x['username']})" for x in new_act[:10]])
-                  if new_exp:
-                      msg.append(f"\n🔴 <b>انتهى الآن ({len(new_exp)}):</b>")
-                      msg.extend([f"• {x['name']} ({x['username']})" for x in new_exp[:10]])
-                  requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": "\n".join(msg), "parse_mode": "HTML"})
+              print(f"🎉 اكتملت المزامنة المباشرة ({now_iq}): {out['activeCount']} شغال | {out['expiredCount']} منتهي/طافي")
+
+              if newly_activated or newly_expired:
+                  lines = [f"📡 <b>تحديث تلقائي برقم الفات — رادار FTTH IQ ({now_iq})</b>"]
+                  if newly_activated:
+                      lines.append(f"\n🟢 <b>تم تفعيل / تجديد ({len(newly_activated)} مشترك):</b>")
+                      for x in newly_activated[:10]:
+                          lines.append(f"• {x['name']} — <b>{x.get('fat') or 'FAT'}</b> ({x.get('fdt') or ''}) [{x['account']}]")
+                  if newly_expired:
+                      lines.append(f"\n🔴 <b>انتهى اشتراكهم الآن ({len(newly_expired)} مشترك):</b>")
+                      for x in newly_expired[:10]:
+                          lines.append(f"• {x['name']} — <b>{x.get('fat') or 'FAT'}</b> ({x.get('fdt') or ''}) [{x['account']}]")
+                  send_telegram_alert("\n".join(lines))
+
+          if __name__ == "__main__":
+              main()
           EOF
 
       - name: Save live_sync.json to Repo
         run: |
-          if [ -f live_sync.json ]; then
-            git config user.name "FTTH Radar Bot"
-            git config user.email "bot@ftth-radar.local"
-            git add live_sync.json
-            git diff --staged --quiet || (git commit -m "Live Sync Update" && git push)
+          git config user.name "FTTH Radar Bot"
+          git config user.email "bot@ftth-radar.local"
+          git add live_sync.json
+          if ! git diff --staged --quiet; then
+            git commit -m "🔄 Live FTTH Sync $(date -u +'%Y-%m-%d %H:%M')"
+            git push
           fi
-          
