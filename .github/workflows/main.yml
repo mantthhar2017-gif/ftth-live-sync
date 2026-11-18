@@ -157,24 +157,24 @@ jobs:
               print(f"📡 [{acct['code']}] سحب أرقام الفات (FAT) من صفحة المشتركين...")
               page.goto("https://admin.ftth.iq/customers", wait_until="networkidle", timeout=60000)
               page.wait_for_timeout(3000)
-              for _ in range(65):
+              for _ in range(140):
                   next_btn = page.locator("button.mat-paginator-navigation-next, [aria-label*='Next'], [aria-label*='التالي']").first
                   if next_btn.count() == 0 or next_btn.is_disabled():
                       break
                   next_btn.click()
-                  page.wait_for_timeout(1600)
+                  page.wait_for_timeout(1200)
               print(f"✅ [{acct['code']}] تم سحب رقم الفات الرسمي لـ {len(captured_fats)} مشترك.")
 
               # PHASE 2: Pull live Active/Expired status & sessions from /subscriptions
               print(f"📡 [{acct['code']}] سحب حالات الشغال والطافي من صفحة الاشتراكات...")
               page.goto("https://admin.ftth.iq/subscriptions", wait_until="networkidle", timeout=60000)
               page.wait_for_timeout(3000)
-              for _ in range(65):
+              for _ in range(140):
                   next_btn = page.locator("button.mat-paginator-navigation-next, [aria-label*='Next'], [aria-label*='التالي']").first
                   if next_btn.count() == 0 or next_btn.is_disabled():
                       break
                   next_btn.click()
-                  page.wait_for_timeout(1500)
+                  page.wait_for_timeout(1100)
               print(f"✅ [{acct['code']}] تم سحب حالة الاشتراك لـ {len(captured_subs)} مشترك.")
 
               page.remove_listener("response", on_response)
