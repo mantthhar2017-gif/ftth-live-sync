@@ -1,0 +1,227 @@
+name: FTTH Live FAT Unplug Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: 'Account code (alhil or hle)'
+        required: true
+        default: 'alhil'
+      fat:
+        description: 'FAT label (e.g. FAT42)'
+        required: false
+        default: ''
+      sub_ids:
+        description: 'Comma-separated subscriber IDs'
+        required: true
+        default: ''
+      request_id:
+        description: 'Unique request ID from app'
+        required: true
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  check_fat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Run Targeted FAT Check
+        env:
+          FTTH_ALHIL_USER: ${{ secrets.FTTH_ALHIL_USER }}
+          FTTH_ALHIL_PASS: ${{ secrets.FTTH_ALHIL_PASS }}
+          FTTH_HLE_USER: ${{ secrets.FTTH_HLE_USER }}
+          FTTH_HLE_PASS: ${{ secrets.FTTH_HLE_PASS }}
+          IN_ACCOUNT: ${{ github.event.inputs.account }}
+          IN_FAT: ${{ github.event.inputs.fat }}
+          IN_SUB_IDS: ${{ github.event.inputs.sub_ids }}
+          IN_REQ_ID: ${{ github.event.inputs.request_id }}
+        run: |
+          python - << 'EOF'
+          import json, os, time
+          from datetime import datetime, timezone, timedelta
+          from playwright.sync_api import sync_playwright
+
+          IQ_TZ = timezone(timedelta(hours=3))
+          t0 = time.time()
+
+          acct_code = (os.environ.get("IN_ACCOUNT") or "alhil").strip().lower()
+          fat_label = (os.environ.get("IN_FAT") or "").strip()
+          req_id = (os.environ.get("IN_REQ_ID") or str(int(time.time()))).strip()
+          target_ids = {x.strip() for x in (os.environ.get("IN_SUB_IDS") or "").split(",") if x.strip()}
+
+          if acct_code == "hle":
+              username = os.environ.get("FTTH_HLE_USER", "").strip()
+              password = os.environ.get("FTTH_HLE_PASS", "").strip()
+          else:
+              acct_code = "alhil"
+              username = os.environ.get("FTTH_ALHIL_USER", "").strip()
+              password = os.environ.get("FTTH_ALHIL_PASS", "").strip()
+
+          if not username or not password:
+              raise SystemExit(f"Missing GitHub Secrets for {acct_code}")
+
+          def normalize_item(item):
+              if not isinstance(item, dict) or "customer" not in item:
+                  return None
+              cid = str((item.get("customer") or {}).get("id") or "").strip()
+              if not cid:
+                  return None
+              exp_iso = str(item.get("expires") or "")
+              now_utc = datetime.now(timezone.utc)
+              days_expired = 0
+              is_active = item.get("status") == "Active"
+              if exp_iso:
+                  try:
+                      clean = exp_iso.replace("Z", "+00:00")
+                      if "T" not in clean:
+                          clean = clean[:10] + "T23:59:59+00:00"
+                      dt = datetime.fromisoformat(clean)
+                      if dt.tzinfo is None:
+                          dt = dt.replace(tzinfo=timezone.utc)
+                      if dt <= now_utc:
+                          is_active = False
+                          days_expired = max(1, int((now_utc - dt).total_seconds() // 86400))
+                  except Exception:
+                      pass
+              elif not is_active:
+                  days_expired = 999
+              has_sess = bool(item.get("hasActiveSession"))
+              active_sess = item.get("activeSession") or {}
+              rx_power = item.get("rxPower") or active_sess.get("rxPower") or None
+              return {
+                  "subId": cid,
+                  "name": str((item.get("customer") or {}).get("displayValue") or "").strip(),
+                  "username": str(item.get("username") or "").strip(),
+                  "status": "Active" if is_active else "Inactive",
+                  "isActive": is_active,
+                  "hasActiveSession": has_sess if is_active else False,
+                  "expires": exp_iso[:10],
+                  "expiresIso": exp_iso,
+                  "daysExpired": days_expired,
+                  "expiredOver60Days": (not is_active) and (days_expired >= 60),
+                  "ipAddress": item.get("ipAddress") or active_sess.get("ipAddress") or "",
+                  "rxPower": rx_power,
+              }
+
+          found = {}
+          subs_api_url = None
+          subs_api_headers = {}
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context()
+              page = context.new_page()
+
+              def on_request(req):
+                  nonlocal subs_api_url, subs_api_headers
+                  url = req.url or ""
+                  if "subscriptions" in url.lower() and req.resource_type in ("xhr", "fetch"):
+                      subs_api_url = url
+                      subs_api_headers = {
+                          k: v for k, v in req.headers.items()
+                          if k.lower() in ("authorization", "accept", "x-requested-with", "x-tenant", "accept-language")
+                      }
+
+              page.on("request", on_request)
+              page.goto("https://admin.ftth.iq/", wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_selector("input[type='password']", timeout=30000)
+              user_input = page.locator("input:not([type='password']):not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='submit'])").first
+              pass_input = page.locator("input[type='password']").first
+              user_input.fill(username)
+              pass_input.fill(password)
+              submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('تسجيل'), button:has-text('Login'), button:has-text('Sign in')").first
+              if submit_btn.count() > 0:
+                  submit_btn.click()
+              else:
+                  pass_input.press("Enter")
+              page.wait_for_timeout(4500)
+
+              page.goto("https://admin.ftth.iq/subscriptions", wait_until="networkidle", timeout=60000)
+              page.wait_for_timeout(2000)
+
+              if subs_api_url:
+                  raw_items = page.evaluate(
+                      """async ({ baseUrl, headers, targetIds }) => {
+                          const idSet = new Set(targetIds);
+                          const matched = [];
+                          const makeUrl = (pageNum, pageSize) => {
+                              const u = new URL(baseUrl);
+                              if (u.searchParams.has('pageNumber')) u.searchParams.set('pageNumber', String(pageNum));
+                              else if (u.searchParams.has('page')) u.searchParams.set('page', String(pageNum));
+                              else u.searchParams.set('pageNumber', String(pageNum));
+                              if (u.searchParams.has('pageSize')) u.searchParams.set('pageSize', String(pageSize));
+                              else if (u.searchParams.has('size')) u.searchParams.set('size', String(pageSize));
+                              else u.searchParams.set('pageSize', String(pageSize));
+                              return u.toString();
+                          };
+                          for (let start = 1; start <= 15; start += 4) {
+                              const batch = [];
+                              for (let p = start; p < start + 4 && p <= 15; p++) {
+                                  batch.push(fetch(makeUrl(p, 100), { headers, credentials: 'include' }).then(r => r.ok ? r.json() : null).catch(() => null));
+                              }
+                              const responses = await Promise.all(batch);
+                              let anyItems = false;
+                              for (const data of responses) {
+                                  if (!data) continue;
+                                  const items = data.data || data.items || (Array.isArray(data) ? data : []);
+                                  if (!Array.isArray(items) || !items.length) continue;
+                                  anyItems = true;
+                                  for (const it of items) {
+                                      const cid = String((it.customer && it.customer.id) || '').trim();
+                                      if (!idSet.size || idSet.has(cid)) matched.push(it);
+                                  }
+                              }
+                              if (idSet.size && matched.length >= idSet.size) break;
+                              if (!anyItems) break;
+                          }
+                          return matched;
+                      }""",
+                      {"baseUrl": subs_api_url, "headers": subs_api_headers, "targetIds": list(target_ids)},
+                  )
+                  for it in (raw_items or []):
+                      norm = normalize_item(it)
+                      if norm:
+                          found[norm["subId"]] = norm
+
+              context.close()
+              browser.close()
+
+          out = {
+              "ok": True,
+              "requestId": req_id,
+              "account": acct_code,
+              "fat": fat_label,
+              "checkedAt": datetime.now(IQ_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+              "elapsedSec": round(time.time() - t0, 1),
+              "matchedCount": len(found),
+              "results": list(found.values()),
+          }
+          with open("fat_check_result.json", "w", encoding="utf-8") as f:
+              json.dump(out, f, ensure_ascii=False, indent=2)
+          print(f"✅ Done FAT {fat_label}: matched {len(found)} subs in {out['elapsedSec']}s")
+          EOF
+
+      - name: Save fat_check_result.json
+        run: |
+          git config user.name "FTTH Cleaner Bot"
+          git config user.email "cleaner@ftth-radar.local"
+          git add fat_check_result.json
+          if ! git diff --staged --quiet; then
+            git commit -m "⚡ FAT Check ${{ github.event.inputs.fat }} (${{ github.event.inputs.request_id }})"
+            git push
+          fi
